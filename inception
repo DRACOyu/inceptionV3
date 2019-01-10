@@ -1,0 +1,241 @@
+#coding=utf-8
+
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+
+from inception_v3 import *
+from inception_v3 import *
+from scipy.spatial.distance import cdist
+from sklearn.metrics import average_precision_score
+
+from create_tf_record import *
+
+# import slim.nets.inception_v3 as inception_v3
+# import slim.nets.inception_v3 as inception_v3
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+
+def cmc(distmat , query_ids=None , gallery_ids=None , query_cams=None , gallery_cams=None , topk=500 ,
+        separate_camera_set=False , single_gallery_shot=False , first_match_break=False ):
+    m, n = distmat.shape
+    # Fill up default values
+    if query_ids is None:
+        query_ids = np.arange(m)
+    if gallery_ids is None:
+        gallery_ids = np.arange(n)
+    if query_cams is None:
+        query_cams = np.zeros(m).astype(np.int32)
+    if gallery_cams is None:
+        gallery_cams = np.ones(n).astype(np.int32)
+    # Ensure numpy array
+    query_ids = np.asarray(query_ids)
+    gallery_ids = np.asarray(gallery_ids)
+    query_cams = np.asarray(query_cams)
+    gallery_cams = np.asarray(gallery_cams)
+    # Sort and find correct matches
+    indices = np.argsort(distmat, axis=1)
+    matches = (gallery_ids[indices] == query_ids[:, np.newaxis])
+    # Compute CMC for each query
+    ret = np.zeros(topk)
+    num_valid_queries = 0
+    for i in range(m):
+        # Filter out the same id and same camera
+        valid = ((gallery_ids[indices[i]] != query_ids[i]) |
+                 (gallery_cams[indices[i]] != query_cams[i]))
+        if separate_camera_set:
+            # Filter out samples from same camera
+            valid &= (gallery_cams[indices[i]] != query_cams[i])
+        if not np.any(matches[i, valid]):
+            continue
+        if single_gallery_shot:
+            repeat = 10
+            gids = gallery_ids[indices[i][valid]]
+            inds = np.where(valid)[0]
+            ids_dict = defaultdict(list)
+            for j, x in zip(inds, gids):
+                ids_dict[x].append(j)
+        else:
+            repeat = 1
+        for _ in range(repeat):
+            if single_gallery_shot:
+                # Randomly choose one instance for each id
+                sampled = (valid & _unique_sample(ids_dict, len(valid)))
+                index = np.nonzero(matches[i, sampled])[0]
+            else:
+                index = np.nonzero(matches[i, valid])[0]
+            delta = 1. / (len(index) * repeat)
+            for j, k in enumerate(index):
+                if k - j >= topk:
+                    break
+                if first_match_break:
+                    ret[k - j] += 1
+                    break
+                ret[k - j] += delta
+        num_valid_queries += 1
+    if num_valid_queries == 0:
+        raise RuntimeError("No valid query")
+    return ret.cumsum() / num_valid_queries
+
+
+def mean_ap(distmat , query_ids=None , gallery_ids=None ,query_cams=None , gallery_cams=None ):
+    m, n = distmat.shape
+    # Fill up default values
+    if query_ids is None:
+        query_ids = np.arange(m)
+    if gallery_ids is None:
+        gallery_ids = np.arange(n)
+    if query_cams is None:
+        query_cams = np.zeros(m).astype(np.int32)
+    if gallery_cams is None:
+        gallery_cams = np.ones(n).astype(np.int32)
+    # Ensure numpy array
+    query_ids = np.asarray(query_ids)
+    gallery_ids = np.asarray(gallery_ids)
+    query_cams = np.asarray(query_cams)
+    gallery_cams = np.asarray(gallery_cams)
+    # Sort and find correct matches
+    indices = np.argsort(distmat, axis=1)
+    matches = (gallery_ids[indices] == query_ids[:, np.newaxis])
+    # Compute AP for each query
+    aps = []
+    for i in range(m):
+        # Filter out the same id and same camera
+        valid = ((gallery_ids[indices[i]] != query_ids[i]) | (gallery_cams[indices[i]] != query_cams[i]))
+        # print(valid)
+        y_true = matches[i, valid]
+        y_score = -distmat[i][indices[i]][valid]
+        if not np.any(y_true):
+            continue
+        aps.append(average_precision_score(y_true, y_score))
+    if len(aps) == 0:
+        raise RuntimeError("No valid query")
+
+    # query_index = np.argwhere(gallery_ids==query_ids)
+    # camera_index = np.argwhere(gallery_cams==query_cams)
+    # good_index = np.setdiff1d(query_index, camera_index, assume_unique=True)
+    # junk_index1 = np.argwhere(gallery_ids==-1)
+    # junk_index2 = np.intersect1d(query_index, camera_index)
+    # junk_index = np.append(junk_index2, junk_index1) #.flatten())
+
+    # CMC_tmp = compute_mAP(indices, good_index, junk_index)
+    # return CMC_tmp
+    return np.mean(aps)
+
+
+def Evaluation(models_path , query_file , gallery_file , labels_nums , data_shape ):
+
+    test_label_nums=3060
+    [batch_size,resize_height,resize_width,depths]=data_shape
+    input_images = tf.placeholder(dtype=tf.float32, shape=[None, resize_height, resize_width, depths], name='input')
+    input_labels = tf.placeholder(dtype=tf.int32, shape=[None, test_label_nums], name='label')
+
+    # with slim.arg_scope(inception_v3.inception_v3_arg_scope()):
+        # out, end_points = inception_v3.inception_v3(inputs=input_images, num_classes=labels_nums, dropout_keep_prob=1.0)
+
+    with tf.contrib.slim.arg_scope(inception_v3_arg_scope()):
+      logits_reid, end_points = inception_v3(input_images,
+                                      num_classes=labels_nums,
+                                      global_pool=False)
+
+    out1 = end_points['PreLogits']
+    out = tf.squeeze(out1, [1, 2], name='SpatialSqueeze1')
+    sess = tf.InteractiveSession()
+    sess.run(tf.global_variables_initializer())
+    sess.run(tf.local_variables_initializer())
+
+    # variables_to_restore = tf.contrib.framework.get_variables_to_restore(include=['InceptionV3'])
+    #
+    # # exclusions = ['InceptionV3/Logits','InceptionV3/AuxLogits']
+    # # inception_except_logits = slim.get_variables_to_restore(exclude=exclusions)
+    # # # 建立一个从预训练模型checkpoint中读取上述列表中的相应变量的参数的函数
+    # # init_fn = slim.assign_from_checkpoint_fn(Pretrained_model_dir, inception_except_logits, ignore_missing_vars=True)
+    # # # 运行该函数
+    # # init_fn(sess)
+
+    saver = tf.train.Saver()
+    saver.restore(sess, models_path)
+
+    query_feature=[]
+    query_label=[]
+    F = open(query_file).readlines()
+    for f  in F:
+        image_path, label = f.split()
+        image_path = os.path.join("/yzc/data/MSMT17_V1",image_path)
+        im=read_image(image_path,resize_height,resize_width,normalization=True)
+        im=im[np.newaxis,:]
+        feature = sess.run(out, feed_dict={input_images: im})
+        
+        # feature_out = tf.squeeze(feature)
+
+        query_feature.append(feature)
+        query_label.append(label)
+
+
+
+    gallery_feature=[]
+    gallery_label=[]
+    G = open(gallery_file).readlines()
+    for f  in   G:
+        image_path, label = f.split()
+        image_path = os.path.join("/yzc/data/MSMT17_V1",image_path)
+        im1=read_image(image_path,resize_height,resize_width,normalization=True)
+        im1=im1[np.newaxis,:]
+        feature = sess.run(out, feed_dict={input_images: im1})
+        # feature_out = tf.squeeze(feature)
+
+        gallery_feature.append(feature)
+        gallery_label.append(label)
+
+
+    query_feature1 =np.asarray(query_feature)
+    gallery_feature1 =np.asarray(gallery_feature)
+    query_feature2 = tf.squeeze(query_feature1)
+    gallery_feature2 = tf.squeeze(gallery_feature1)
+    query_feature4 = query_feature2.eval() 
+    gallery_feature4 = gallery_feature2.eval() 
+
+    print("query_feature4",query_feature4.shape)
+    print("gallery_feature4",gallery_feature4.shape)
+    print("run  no error")
+
+    dist = cdist(query_feature4, gallery_feature4)
+    print(dist.shape)
+    print(dist[0,:])
+    r = cmc(dist, query_label, gallery_label,
+           separate_camera_set=False,
+           single_gallery_shot=False,
+           first_match_break=True)
+
+    gallery_label =np.array(gallery_label)
+    query_label =np.array(query_label)
+    m_ap = mean_ap(dist, query_label, gallery_label)
+    print(m_ap)
+    print(' mAP=%f' % (m_ap))
+    print('modelname = %s , mAP=%f, r@1=%f, r@10=%f, r@25=%f, r@50=%f, r@100=%f' % (models_path,m_ap, r[0], r[9], r[24], r[49], r[99]))
+    return m_ap,r[0]
+
+
+if __name__ == '__main__':
+
+    query_file = '/yzc/data/MSMT17_V1/msmt_list_query.txt'
+    gallery_file = '/yzc/data/MSMT17_V1/msmt_list_gallery.txt'
+    class_nums=1041
+
+    models_path='/yzc/test/multi-reid/model_reid-ft-3/model.ckpt-298774'
+
+
+    batch_size = 1  #
+    resize_height = 512  # 指定存储图片高度
+    resize_width = 170  # 指定存储图片宽度
+    depths=3
+    data_format=[batch_size,resize_height,resize_width,depths]
+
+    Evaluation(models_path=models_path,
+          query_file=query_file,
+          gallery_file=gallery_file,
+          labels_nums=class_nums,
+          data_shape=data_format)
